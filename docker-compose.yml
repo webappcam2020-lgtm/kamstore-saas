@@ -1,0 +1,164 @@
+version: '3.9'
+
+services:
+  # ============================================
+  # PostgreSQL Database
+  # ============================================
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: kamstore-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kamstore}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kamstore_secret_2024}
+      POSTGRES_DB: ${POSTGRES_DB:-kamstore_db}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kamstore}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kamstore-network
+
+  # ============================================
+  # Redis Cache
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: kamstore-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-kamstore_redis_2024}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-kamstore_redis_2024}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kamstore-network
+
+  # ============================================
+  # Backend API - FastAPI
+  # ============================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kamstore-backend
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-kamstore}:${POSTGRES_PASSWORD:-kamstore_secret_2024}@db:5432/${POSTGRES_DB:-kamstore_db}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-kamstore_redis_2024}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-super-secret-key-change-in-production}
+      - DEBUG=${DEBUG:-true}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:8000}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - MTN_MOMO_API_KEY=${MTN_MOMO_API_KEY:-}
+      - MTN_MOMO_API_SECRET=${MTN_MOMO_API_SECRET:-}
+      - ORANGE_MONEY_API_KEY=${ORANGE_MONEY_API_KEY:-}
+      - NUMVERIFY_API_KEY=${NUMVERIFY_API_KEY:-}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend/app:/app/app
+      - upload_data:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kamstore-network
+
+  # ============================================
+  # Frontend - Next.js
+  # ============================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: kamstore-frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+      - NEXT_PUBLIC_APP_NAME=KamStore
+      - NEXT_PUBLIC_MAP_TILE_URL=https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - backend
+    networks:
+      - kamstore-network
+
+  # ============================================
+  # Celery Worker (Background Tasks)
+  # ============================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kamstore-celery-worker
+    restart: unless-stopped
+    command: celery -A app.core.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-kamstore}:${POSTGRES_PASSWORD:-kamstore_secret_2024}@db:5432/${POSTGRES_DB:-kamstore_db}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-kamstore_redis_2024}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-super-secret-key-change-in-production}
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kamstore-network
+
+  # ============================================
+  # Celery Beat (Scheduled Tasks)
+  # ============================================
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kamstore-celery-beat
+    restart: unless-stopped
+    command: celery -A app.core.celery_app beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-kamstore}:${POSTGRES_PASSWORD:-kamstore_secret_2024}@db:5432/${POSTGRES_DB:-kamstore_db}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-kamstore_redis_2024}@redis:6379/0
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kamstore-network
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  upload_data:
+    driver: local
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  kamstore-network:
+    driver: bridge
